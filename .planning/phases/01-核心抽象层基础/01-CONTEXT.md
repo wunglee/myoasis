@@ -11,12 +11,11 @@
 建立领域无关的核心抽象层，定义双聚合根模型（Entity+Role），实现绝对抽象的实体关系行为传导网络框架基础。
 
 本阶段交付：
-- Entity（聚合根，Compose聚合Role，接收Role消息）
-- Role（聚合根，状态机，内部Act→Think→Action驱动）
-- ActionType（枚举，可扩展）
-- Action（内部行为，驱动Strategy执行，返回Result）
-- Result（Action执行结果，payload可包含Strategy）
-- Strategy（策略对象，组合模式，由Action驱动执行）
+- Entity（聚合根，Compose聚合Role，接收Role消息，按规则做内部传播）
+- Role（聚合根，含基本属性+扩展properties，持有状态机实例）
+- Action（一等行为对象，接收Role参数，含beforeExecute、execute、afterExecute）
+- ActionType（Action的key，可扩展）
+- StateMachine（上层业务注入，持actions: dict[ActionType, Action]）
 - Relation（Role间关联关系）
 - StateStorage（存储抽象）
 
@@ -33,98 +32,133 @@
 - **Entity作为聚合根**：
   - **Compose聚合**多个Role（直接包含Role对象，不是引用）
   - 统一接收内部Role消息（`on_role_message`）
-  - 不负责外部消息转发，不负责Role间关系管理
+  - 负责按配置的传播规则，将内部Role消息转发给其他Role
+  - 不负责外部消息转发（外部Role通过Relation直接交互）
 
 - **Role作为聚合根**：
   - 独立的生命周期，但由Entity Compose聚合
-  - 自主管理与外部Role的关联关系（Relation）
-  - 内部状态机驱动行为（Act→Think→Action）
-  - 直接与其他Role交互（通过Relation）
+  - 基本属性（id, owner, role_type等）为不可变标识
+  - **可扩展属性** `properties: dict[str, Any]`，用于领域特定状态/参数
+  - 自主管理与外部Role的关联关系（`relations: list[Relation]`）
+  - 初始化时从配置读取并创建状态机实例，负责保存状态机状态
+  - 统一通过 `act(action: Action)` 接受任何调用（无论来自外部Role还是Entity内部转发）
 
-### D-02: Role状态机模型
-**决策：** Role本质是状态机，状态决定可接受ActionType
-
-- Role有当前状态（State）
-- 状态决定可接受的ActionType集合
-- `get_acceptable_actions()` 查询当前可接受ActionType
-- Act是外部触发入口，内部驱动Think→Action
-
-### D-03: Act→Think→Action内部行为链
-**决策：** Act、Think、Action都是Role内部行为，不是外部操作
-
-| 阶段 | 类型 | 职责 |
-|------|------|------|
-| **Act** | 外部触发入口 | 接收ActionType和payload，返回Result |
-| **Think** | 内部行为 | 基于当前状态和输入进行决策，可能更新状态 |
-| **Action** | 内部行为 | 执行决策，驱动Strategy执行，返回Result |
-
-### D-04: Result对象作为Action返回
-**决策：** `act()`方法返回Result对象，不是Strategy
+### D-02: Role 的可用 Action 由状态机决定
+**决策：** 状态机维护 `actions: dict[ActionType, Action]`，并根据当前状态决定可用的 ActionType
 
 ```python
-class Result:
-    success: bool
-    payload: Any      # 可以是Strategy、数据、或其他Result
-    metadata: dict    # 执行元信息
+class StateMachine:
+    +State current_state
+    +dict[ActionType, Action] actions
+    +get_available_action_types() -> set[ActionType]
+    +get_action(action_type: ActionType) -> Action | None
+    +process(action_type: ActionType, role: Role) -> Any
 ```
 
-- Action执行返回Result
-- Strategy通过Action的payload传递
-- 无独立的receive_strategy方法
+- 状态机持有该角色在当前状态下所有可能的 Action 映射
+- `get_available_action_types()` 返回当前状态下可用的 ActionType 集合
+- Role 的 `act(action)` 接收外部 Action，但通常由调用方确保 ActionType 在可用集合中
+- 状态转移规则、Action 映射都是上层业务逻辑，框架层只负责读取和调度
 
-### D-05: Strategy组合模式 + Action驱动执行
-**决策：** Strategy采用组合模式，由Action驱动执行
-
-```
-Action驱动Strategy执行：
-  Role.act(MEETING, payload={"strategy": MeetingStrategy})
-    ↓
-  Action内部驱动MeetingStrategy.execute()
-    ↓
-  MeetingStrategy返回Result
-    ↓
-  Action处理Result，返回新的Result
-
-Strategy组合模式：
-  MeetingStrategy
-    └─ DecisionStrategy (sub_strategy)
-         └─ ActionItemStrategy
-```
-
-- Strategy不由Action生成，而是由Action驱动执行
-- Strategy可以包含子Strategy（组合模式）
-- Strategy执行返回Result
-- Action接收Strategy的Result，处理后返回新的Result
-
-### D-06: Strategy通过Action payload传递
-**决策：** Strategy通过Action的payload传递，无独立接收方法
+### D-03: Action 是一等对象，接收完整 Role
+**决策：** Action 作为完整行为对象，`beforeExecute`、`execute` 和 `afterExecute` 都接收完整 Role 参数
 
 ```python
-# 传递Strategy示例
-result = role_a.act(ActionType.COMMUNICATE, {
-    "target": role_d,
-    "strategy": decision_strategy  # Strategy通过payload传递
-})
+class Action(ABC):
+    action_type: ActionType
+    payload: Any
+
+    @abstractmethod
+    def beforeExecute(self, role: Role) -> None:
+        """由Role在执行前调用，可用于前置检查或副作用准备"""
+        pass
+
+    @abstractmethod
+    def execute(self, role: Role) -> Any:
+        """由状态机调用，接收完整Role，可访问其基本属性和properties"""
+        pass
+
+    @abstractmethod
+    def afterExecute(self, role: Role) -> None:
+        """由Role在执行后调用，可通过role.relations获取关联Roles，自主决定级联传播"""
+        pass
 ```
 
-### D-07: ActionType可扩展枚举
-**决策：** ActionType是可扩展枚举
+- `execute(role)` 可读取 `role.properties`、`role.state_machine.current_state` 等所有信息
+- Action 可以自主决定是否调用 `role._agent_action(...)`
+- 执行结果设置在 Action 自身属性上，供后续 `afterExecute` 使用
+- `execute` 的返回值由状态机模式的实现决定，框架层不做强制要求
+
+### D-04: Role.act → 状态机 → Action.execute
+**决策：** Role 将 ActionType 交给状态机，状态机从中取出对应 Action 并执行
+
+```
+外部/Entity -> Role.act(action_type, payload)
+                   ↓
+              Role 查找 state_machine 中 action_type 对应的 Action
+                   ↓
+              将 payload 设置到 Action 上（或构造新的 Action 实例）
+                   ↓
+              Role 调用 action.beforeExecute(role)
+                   ↓
+              状态机调用 action.execute(role)
+                   ↓
+              状态机根据返回结果更新状态
+                   ↓
+              Role 保存新状态
+                   ↓
+              Role 调用 action.afterExecute(role)
+                   ↓
+              Action 自行决定级联传播（通知Entity或调用其他Role.act）
+```
+
+- `act` 是 Role 的唯一外部入口，签名可为 `act(action_type: ActionType, payload: Any) -> None`
+- 状态机是上层业务逻辑，框架层只负责把 ActionType 映射到 Action 并递交给状态机
+- 状态转移规则由状态机内部定义，Role 只负责状态存取
+
+### D-05: 智能体接口合并为 _agent_action
+**决策：** 为保持智能体思考-行动的封装，提供单一可选接口
 
 ```python
-class ActionType(Enum):
-    COMMUNICATE = "communicate"      # 单向通信
-    EXCHANGE = "exchange"            # 双向交换
-    MEETING = "meeting"              # 多方会议（驱动MeetingStrategy）
-    EXECUTE = "execute"              # 执行Strategy
-    CONFLICT = "conflict"            # 对抗/竞争
-    # 领域可扩展...
+def _agent_action(
+    self,
+    context: Any,
+    messages: list[Any],
+    skills: list[Any]
+) -> Any:
+    """智能体核心接口：可选实现，供Action.execute调用"""
+    pass
 ```
 
-### D-08: Relation约束Action
-**决策：** 只有存在关联的Role才能交互，关联决定可执行ActionType
+- `_think` 和 `_action` 合并为 `_agent_action`
+- 这是**可选接口**：简单 Action 的 execute 可以完全由程序逻辑完成，不调用它
+- Action.execute(role) 内部可调用 `role._agent_action(...)`，按需使用
 
-- 检查状态是否接受ActionType
-- 检查与from_role是否存在支持该Action的Relation
+### D-06: 级联传播由 Action.afterExecute 主导
+**决策：** 框架层只提供传播通道（让Role能调用关联Role，让Entity能被通知），具体传播逻辑由Action实现
+
+- `Role` 在执行完 Action 后，收集自身 `relations` 关联的 Roles
+- 调用 `action.afterExecute(role)`
+- `Action` 的实现代码里可以：
+  - 调用其他 `role.act(action_type, payload)` 做外部级联
+  - 调用 `role.owner.on_role_message(...)` 通知 Entity
+  - 什么都不做（非传导类Action）
+
+### D-07: Entity 内部传播规则可配置
+**决策：** Entity 如何转发内部 Role 的消息给其他 Role，由初始化配置决定
+
+- Entity 初始化时从配置读取 `propagation_rules`
+- 规则可以是：固定规则（如：所有消息广播给所有内部Role）、条件规则、或 LLM 驱动规则
+- Entity 负责根据规则构造新的 `ActionType + payload`，并调用目标 `Role.act(action_type, payload)`
+- 对内的级联与对外的级联对 Role 来说无差别，都是 `act` 调用
+
+### D-08: Relation 作为 Role 的关联边界
+**决策：** Role 之间的关联通过 Relation 维护
+
+- `Role` 持有自己的 `relations: list[Relation]`
+- Relation 本身不做执行约束，只提供关联查询
+- 是否需要 Relation 存在才能执行某 Action，由 Action 的实现或状态机逻辑决定
+- 框架层保持领域无关，不预设约束语义
 
 </decisions>
 
@@ -133,205 +167,129 @@ class ActionType(Enum):
 <architecture>
 ## Core Architecture
 
-### 类图：双聚合根 + Result返回
+### 类图
 
 ```mermaid
 classDiagram
-    %% 聚合根1：Entity，Compose聚合Role
     class Entity {
         +EntityID id
-        +Map~String, Any~ properties
+        +Map properties
         +List~Role~ roles
-        +on_role_message(role_id: RoleID, message: RoleMessage) void
+        +Map propagation_rules
+        +on_role_message(role_id: RoleID, message: Any) void
+        +propagate_to_roles(source_role_id: RoleID, action_type: ActionType, payload: Any) void
     }
 
-    %% 聚合根2：Role，状态机
     class Role {
         +RoleID id
         +RoleType role_type
         +EntityID owner_id
+        +Map properties
         +StateMachine state_machine
-        +act(action_type: ActionType, payload: Any) Result
-        +get_acceptable_actions() Set~ActionType~
-        -_think(context: ThinkContext) ThinkResult
-        -_action(think_result: ThinkResult) Result
-        -_notify_entity(message: RoleMessage) void
+        +List~Relation~ relations
+        +act(action_type: ActionType, payload: Any) void
+        +_agent_action(context: Any, messages: list, skills: list) Any
+        +get_related_roles() list~Role~
     }
 
-    %% 状态机
     class StateMachine {
         +State current_state
-        +get_acceptable_actions() Set~ActionType~
-        +transition(event: Event) void
+        +Map~ActionType, Action~ actions
+        +get_available_action_types() set~ActionType~
+        +get_action(action_type: ActionType) Action | None
+        +process(action_type: ActionType, role: Role) Any
     }
 
-    %% Result对象
-    class Result {
-        +Bool success
+    class Action {
+        +ActionType action_type
         +Any payload
-        +Map~String, Any~ metadata
+        +beforeExecute(role: Role) void
+        +execute(role: Role) Any
+        +afterExecute(role: Role) void
     }
 
-    %% ActionType枚举
-    class ActionType {
-        <<enumeration>>
-        COMMUNICATE
-        EXCHANGE
-        MEETING
-        EXECUTE
-        CONFLICT
-    }
-
-    %% Strategy组合模式
-    class Strategy {
-        <<abstract>>
-        +StrategyID id
-        +StrategyType strategy_type
-        +List~Strategy~ sub_strategies
-        +execute(context: ExecutionContext) Result
-        +add_strategy(strategy: Strategy) void
-    }
-
-    class MeetingStrategy {
-        +String topic
-        +List~RoleID~ participants
-        +execute(context) Result
-    }
-
-    class DecisionStrategy {
-        +String decision_text
-        +List~ActionItem~ action_items
-        +execute(context) Result
-    }
-
-    %% 关联关系
     class Relation {
         +RoleID from_role
         +RoleID to_role
         +RelationType relation_type
-        +Set~ActionType~ supported_actions
     }
 
-    %% Compose聚合关系
     Entity "1" *-- "*" Role : Compose聚合
-    
-    %% Role内部组成
-    Role "1" *-- "1" StateMachine : 状态机
-    
-    %% Action执行返回Result
-    Role ..> Result : returns
-    
-    %% Action驱动Strategy
-    Role ..> Strategy : drives
-    Strategy ..> Result : returns
-    
-    %% Strategy组合
-    Strategy "1" o-- "*" Strategy : sub_strategies
-    MeetingStrategy --|> Strategy
-    DecisionStrategy --|> Strategy
-    
-    %% Relation
-    Role "1" -- "*" Relation : has
+    Role "1" *-- "1" StateMachine : 包含
+    Role "1" -- "*" Relation : 关联
+    StateMachine "1" --> "*" Action : 持有映射
 ```
 
-### 时序图：Act→Think→Action→Result
+### 时序图：完整的 Act → 状态机 → 传播 流程
 
 ```mermaid
 sequenceDiagram
-    participant Ext as 外部Role
-    participant R as Role (状态机)
+    participant Ext as 外部Role/Entity
+    participant R as Role
     participant SM as StateMachine
-    participant S as Strategy
-    participant E as Entity (家长)
+    participant A as Action
+    participant E as Entity
+    participant Rel as 关联Roles
 
-    Ext->>R: act(MEETING, payload={strategy: MeetingStrategy})
-    
+    Ext->>R: act(action_type, payload)
     activate R
-    
-    %% 检查可接受Action
-    R->>SM: get_acceptable_actions()
-    SM-->>R: {COMMUNICATE, MEETING, ...}
-    
-    %% Think
-    R->>R: _think(context)
-    Note over R: 基于当前状态和payload决策
-    
-    %% 状态更新
-    R->>SM: transition(event)
-    
-    %% Action驱动Strategy
-    R->>S: execute(context)
-    activate S
-    Note over S: MeetingStrategy执行
-    S-->>R: Result
-    deactivate S
-    
-    %% Action处理Result，返回新Result
-    R->>R: process_result()
-    R-->>Ext: Result
-    
-    %% 通知Entity
-    R->>E: on_role_message(role_id, message)
-    
+
+    R->>SM: get_action(action_type)
+    SM-->>R: Action instance
+
+    R->>A: beforeExecute(role)
+    activate A
+    Note over A: 前置检查或副作用准备
+    deactivate A
+
+    R->>SM: process(action_type, role)
+    activate SM
+
+    SM->>A: execute(role)
+    activate A
+    Note over A: Action 可访问 role.properties 等
+    A-->>SM: return (由状态机定义)
+    deactivate A
+
+    SM->>SM: 更新状态
+    SM-->>R: state updated
+    deactivate SM
+
+    R->>A: afterExecute(role)
+    activate A
+
+    alt 级联到关联Role
+        A->>Rel: act(action_type, payload)
+    end
+
+    alt 通知Entity
+        A->>E: on_role_message(role_id, message)
+        E->>E: propagate_to_roles(...)
+        E->>R: act(action_type, payload)
+    end
+
+    deactivate A
     deactivate R
 ```
 
-### 时序图：Strategy传递与执行
-
-```mermaid
-sequenceDiagram
-    participant R1 as Role A (财务)
-    participant MS as MeetingStrategy
-    participant R2 as Role D (执行)
-    participant DS as DecisionStrategy
-
-    %% 发起会议
-    activate R1
-    R1->>R1: act(MEETING, {strategy: MeetingStrategy})
-    
-    R1->>MS: execute()
-    activate MS
-    Note over MS: 会议执行，生成DecisionStrategy
-    MS-->>R1: Result(payload=DecisionStrategy)
-    deactivate MS
-    deactivate R1
-    
-    %% 传递决策
-    R1->>R2: act(COMMUNICATE, {strategy: DecisionStrategy})
-    Note over R1,R2: 通过Relation关联传递
-    
-    %% 执行决策
-    activate R2
-    R2->>R2: act(EXECUTE, {strategy: DecisionStrategy})
-    
-    R2->>DS: execute()
-    activate DS
-    Note over DS: 执行决策ActionItem
-    DS-->>R2: Result(执行结果)
-    deactivate DS
-    deactivate R2
-```
-
-### 状态图：Role状态机
+### 状态图：Role 生命周期
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle: 初始化
-    
-    Idle --> Processing: act()触发
-    
-    state Processing {
-        [*] --> Thinking
-        Thinking --> Acting: Think完成
-        Acting --> [*]: 返回Result
+
+    Idle --> Executing: act(action_type)触发
+
+    state Executing {
+        [*] --> BeforeExecute: 调用 beforeExecute(role)
+        BeforeExecute --> StateMachineProcess
+        StateMachineProcess --> ActionExecute: 调用 execute(role)
+        ActionExecute --> StateUpdate: 返回结果
+        StateUpdate --> AfterExecute: 状态已保存
+        AfterExecute --> [*]: 级联传播完成
     }
-    
-    Processing --> Idle: Result返回
-    Processing --> WaitingResponse: 等待外部
-    
-    WaitingResponse --> Processing: 收到响应
-    WaitingResponse --> Idle: 超时/取消
-    
+
+    Executing --> Idle: 执行完成
     Idle --> [*]: Entity销毁
 ```
 
@@ -342,65 +300,45 @@ graph TB
     subgraph "Core Framework"
         subgraph "Entity Module"
             E[Entity Aggregate]
+            PR[Propagation Rules]
         end
-        
+
         subgraph "Role Module"
             R[Role Aggregate]
-            SM[StateMachine]
+            P[properties Map]
+            SM[StateMachine 托管]
+            REL[Relations]
         end
-        
+
         subgraph "Behavior Module"
-            AT[ActionType Enum]
-            RS[Result]
-        end
-        
-        subgraph "Strategy Module"
-            ST[Strategy Abstract]
-            MS[MeetingStrategy]
-            DS[DecisionStrategy]
-        end
-        
-        subgraph "Relation Module"
-            REL[Relation]
+            AT[ActionType]
+            A[Action]
         end
     end
-    
+
     E -->|Compose聚合| R
-    R -->|包含| SM
-    R -->|返回| RS
-    R -->|驱动| ST
-    ST -->|返回| RS
-    ST -->|组合| ST
-    MS -->|具体化| ST
-    DS -->|具体化| ST
-    R -->|关联| REL
+    E -->|配置| PR
+    R -->|持有| P
+    R -->|持有| SM
+    R -->|管理| REL
+    R -->|统一入口| AT
+    SM -->|映射| A
 ```
 
-### 数据流图：Action→Strategy→Result
+### 数据流图
 
 ```mermaid
 flowchart LR
-    subgraph "Role"
-        A[act]
-        T[think]
-        AC[action]
-    end
-    
-    subgraph "Strategy"
-        S[Strategy]
-        EX[execute]
-    end
-    
-    subgraph "Output"
-        R[Result]
-    end
-    
-    A --> T
-    T --> AC
-    AC -->|驱动| S
-    S --> EX
-    EX -->|返回| R
-    AC -->|处理Result| R
+    In["act(action_type, payload)"] --> Role
+    Role --> BE["action.beforeExecute(role)"]
+    BE --> SM[StateMachine]
+    SM --> A[Action]
+    A --> EX["action.execute(role)"]
+    EX --> Result
+    Result --> SM
+    SM --> Save["保存状态"]
+    Save --> AE["action.afterExecute(role)"]
+    AE --> Cascade["级联传播"]
 ```
 
 </architecture>
@@ -410,156 +348,156 @@ flowchart LR
 <specifics>
 ## 具体设计规范
 
-### Entity接口定义
+### Entity 接口定义
 
 ```python
 class Entity(ABC):
-    """聚合根：Compose聚合Role，统一接收Role消息"""
-    
+    """聚合根：Compose聚合Role，接收Role消息，按规则做内部传播"""
+
     @property
     @abstractmethod
     def entity_id(self) -> EntityID: pass
-    
+
     @property
     @abstractmethod
     def properties(self) -> dict[str, Any]: pass
-    
+
     @property
     @abstractmethod
     def roles(self) -> list[Role]: pass
-    
+
+    @property
     @abstractmethod
-    def on_role_message(self, role_id: RoleID, message: RoleMessage) -> None: pass
+    def propagation_rules(self) -> dict[str, Any]: pass
+
+    @abstractmethod
+    def on_role_message(self, role_id: RoleID, message: Any) -> None: pass
+
+    @abstractmethod
+    def propagate_to_roles(
+        self,
+        source_role_id: RoleID,
+        action_type: ActionType,
+        payload: Any
+    ) -> None: pass
 ```
 
-### Role接口定义
+### Role 接口定义
 
 ```python
 class Role(ABC):
-    """聚合根：状态机，Act→Think→Action驱动"""
-    
+    """聚合根：含扩展properties，持有状态机，统一通过act接受调用"""
+
     @property
     @abstractmethod
     def role_id(self) -> RoleID: pass
-    
+
+    @property
+    @abstractmethod
+    def owner(self) -> Entity: pass
+
+    @property
+    @abstractmethod
+    def properties(self) -> dict[str, Any]: pass
+
     @property
     @abstractmethod
     def state_machine(self) -> StateMachine: pass
-    
+
+    @property
     @abstractmethod
-    def get_acceptable_actions(self) -> set[ActionType]: pass
-    
+    def relations(self) -> list[Relation]: pass
+
     @abstractmethod
-    def act(self, action_type: ActionType, payload: Any) -> Result:
-        """外部触发，内部驱动，返回Result"""
+    def act(self, action_type: ActionType, payload: Any) -> None:
+        """统一入口：由状态机查找Action并执行，完成后触发afterExecute"""
         pass
-    
+
     @abstractmethod
-    def _think(self, context: ThinkContext) -> ThinkResult: pass
-    
-    @abstractmethod
-    def _action(self, think_result: ThinkResult) -> Result: pass
-```
-
-### Result对象
-
-```python
-class Result:
-    """Action执行结果"""
-    success: bool
-    payload: Any      # 可以是Strategy、数据、其他Result
-    metadata: dict[str, Any]
-```
-
-### Strategy组合模式
-
-```python
-class Strategy(ABC):
-    """策略对象：组合模式，由Action驱动执行"""
-    
-    strategy_id: StrategyID
-    strategy_type: StrategyType
-    sub_strategies: list[Strategy] = []
-    
-    @abstractmethod
-    def execute(self, context: ExecutionContext) -> Result:
-        """执行策略，返回Result"""
+    def _agent_action(
+        self,
+        context: Any,
+        messages: list[Any],
+        skills: list[Any]
+    ) -> Any:
+        """可选的智能体接口，供Action.execute调用"""
         pass
-    
-    def add_strategy(self, strategy: Strategy) -> None:
-        """组合模式：添加子策略"""
-        self.sub_strategies.append(strategy)
-
-
-class MeetingStrategy(Strategy):
-    """会议策略：由Action驱动执行"""
-    
-    topic: str
-    participants: list[RoleID]
-    
-    def execute(self, context: ExecutionContext) -> Result:
-        # 执行会议逻辑
-        # 生成DecisionStrategy作为sub_strategy
-        decision = DecisionStrategy(...)
-        self.add_strategy(decision)
-        
-        return Result(
-            success=True,
-            payload=decision,  # 返回DecisionStrategy
-            metadata={"topic": self.topic}
-        )
-
-
-class DecisionStrategy(Strategy):
-    """决策策略：可被传递和执行"""
-    
-    decision_text: str
-    action_items: list[ActionItem]
-    
-    def execute(self, context: ExecutionContext) -> Result:
-        # 执行决策中的ActionItem
-        results = []
-        for item in self.action_items:
-            result = self._execute_item(item)
-            results.append(result)
-        
-        return Result(
-            success=True,
-            payload=results,
-            metadata={"decision": self.decision_text}
-        )
 ```
 
-### Action驱动Strategy示例
+### Action 接口定义
 
 ```python
-class Role:
-    def act(self, action_type: ActionType, payload: Any) -> Result:
-        # 1. 检查状态
-        if action_type not in self.get_acceptable_actions():
-            return Result(success=False, payload="Action not acceptable")
-        
-        # 2. Think
-        think_result = self._think(ThinkContext(action_type, payload))
-        
-        # 3. Action执行
-        return self._action(think_result)
-    
-    def _action(self, think_result: ThinkResult) -> Result:
-        action_type = think_result.action_type
-        payload = think_result.payload
-        
-        # 情况1：驱动Strategy执行
-        if "strategy" in payload:
-            strategy = payload["strategy"]
-            strategy_result = strategy.execute(
-                ExecutionContext(role=self, action_type=action_type)
-            )
-            # 处理Strategy结果，返回新Result
-            return self._process_strategy_result(strategy_result)
-        
-        # 情况2：普通Action执行
-        return Result(success=True, payload=None)
+class Action(ABC):
+    """一等行为对象：接收完整Role，含执行逻辑和传播逻辑"""
+
+    action_type: ActionType
+    payload: Any
+
+    @abstractmethod
+    def beforeExecute(self, role: Role) -> None:
+        """由Role在执行前调用，可用于前置检查、副作用准备或拦截"""
+        pass
+
+    @abstractmethod
+    def execute(self, role: Role) -> Any:
+        """由状态机调用，接收完整Role，可访问其属性和properties"""
+        pass
+
+    @abstractmethod
+    def afterExecute(self, role: Role) -> None:
+        """由Role在执行后调用，可通过role.relations获取关联Roles，自主决定级联传播"""
+        pass
+```
+
+### StateMachine 接口定义
+
+```python
+class StateMachine(ABC):
+    """上层业务注入的状态机，持Action映射，框架层只负责托管和调度"""
+
+    @property
+    @abstractmethod
+    def current_state(self) -> State: pass
+
+    @property
+    @abstractmethod
+    def actions(self) -> dict[ActionType, Action]: pass
+
+    @abstractmethod
+    def get_available_action_types(self) -> set[ActionType]:
+        """根据当前状态返回可用的ActionType集合"""
+        pass
+
+    @abstractmethod
+    def get_action(self, action_type: ActionType) -> Action | None:
+        """根据ActionType获取对应的Action实例"""
+        pass
+
+    @abstractmethod
+    def process(self, action_type: ActionType, role: Role) -> Any:
+        """接收ActionType和Role，取出Action执行execute，更新状态，返回结果"""
+        pass
+```
+
+### Entity 转发示例
+
+```python
+class Entity:
+    def on_role_message(self, role_id: RoleID, message: Any) -> None:
+        for rule in self.propagation_rules:
+            if rule.matches(role_id, message):
+                action_type, payload = rule.build_action(message)
+                self.propagate_to_roles(role_id, action_type, payload)
+
+    def propagate_to_roles(
+        self,
+        source_role_id: RoleID,
+        action_type: ActionType,
+        payload: Any
+    ) -> None:
+        for role in self.roles:
+            if role.role_id != source_role_id:
+                role.act(action_type, payload)
 ```
 
 </specifics>
@@ -577,6 +515,14 @@ class Role:
 - `.planning/codebase/CONVENTIONS.md` — Python类型注解、ABC抽象基类规范
 
 </canonical_refs>
+
+---
+
+<deferred>
+## Deferred Ideas
+
+None — discussion stayed within phase scope
+</deferred>
 
 ---
 
